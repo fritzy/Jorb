@@ -26,10 +26,12 @@ module Blather
 				c.state = state
 				c.item = jobid
 				if payload
-					c << payload
+					#c.pubsubjob << payload
+					c.payload = payload
 				end
 				c
 			end 
+
 			
 			# Attempt to claim a job
 			def claim(channel, jobid, &callback)
@@ -38,7 +40,7 @@ module Blather
 			
 			# Notify processing of job
 			def process(channel, jobid, &callback)
-				request set_job_state(channel, jobid, :processed), nil, callback
+				request set_job_state(channel, jobid, :processing), nil, callback
 			end
 			
 			# Cancel a job
@@ -48,7 +50,7 @@ module Blather
 			
 			# Notify job finished and optionally send result
 			def finish(channel, jobid, payload, &callback)
-				request set_job_state(channel, jobid, :result, payload), nil, callback
+				request set_job_state(channel, jobid, :finished, payload), nil, callback
 			end
 
 			private
@@ -125,6 +127,15 @@ class Stanza
 		def item
 			pubsubjob[:item]
 		end
+
+		def payload
+			pubsubjob.child
+		end
+
+		def payload=(content)
+			pubsubjob << content
+		end
+
     
 	# Get or create the pubsub node on the stanza
     #
@@ -145,13 +156,95 @@ end #Stanza
 end #Blather
 
 module Blather
+
+class JobSequence
+	def initialize pubsub, client
+		@step = 0
+		@steps = []
+		@ran_steps = []
+		@results = {}
+		@result_map = {}
+		@pending = []
+		@waiting = false
+		@pubsub = pubsub
+		@client = client
+
+		pubsubjob_event :state => 'finished' do |p|
+			if @result_map.has_key? p.jobid
+				@results[@result_map[p.jobid]] = p.payload
+				@result_map.delete p.jobid
+			end
+			@pending.delete p.jobid
+			if @pending.length == 0 && @waiting
+				@waiting = false
+				runnext
+			end
+		end
+	end
+
+	def steps=(steps)
+		@steps = steps
+	end
+
+	def []=(key, value)
+		@results[key] = value
+	end
+
+	def [](key)
+		@results[key]
+	end
+
+	def run
+		runnext
+	end
+
+	def next(pointer, args=[])
+		@steps << [pointer, args]
+		self
+	end
+
+	def wait
+		@steps << :wait
+		self
+	end
+
+	def done
+		@steps << :done
+		self
+	end
+
+	def runnext
+		while !@waiting && @step < @steps.length
+			if @steps[@step] == :wait
+				@waiting = true
+			elsif @steps[@step] == :done
+				@step = 0
+				@waiting = false
+				break
+			else
+				pointer, args = @steps[@step]
+				pointer.call self, *args
+				#@steps[@step].call self
+			end
+			@step += 1
+		end
+	end
+
+	def publish(node, payload, result_name)
+		pubsub.publish node, payload do |iq|
+			iq.items.each do |item|
+				@pending << item[:id]
+				@result_map[item[:id]] = result_name
+			end
+		end
+	end
+end
 	class Stanza
 	
 		class PubSubJob
 		
 		class JobEvent < Message
 			register :pubsubjob_event, :pubsubjob, 'http://andyet.net/protocol/pubsubjob#event'
-
 
 		def self.new(type = nil)
 		  node = super
@@ -174,6 +267,26 @@ module Blather
 
 		def state
 			event_node[:state]
+		end
+
+		def claimed?
+			event_node[:state] == 'claimed'
+		end
+		
+		def processing?
+			event_node[:state] == 'processing'
+		end
+		
+		def finished?
+			event_node[:state] == 'finished'
+		end
+
+		def cancelled?
+			event_node[:state] == 'cancelled'
+		end
+
+		def payload
+			event_node.child
 		end
 
 		def event_node
